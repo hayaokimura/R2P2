@@ -532,30 +532,8 @@ static void
 c_hid_task(mrbc_vm *vm, mrbc_value *v, int argc)
 {
   (void) vm;
-
-  if(keyboard_modifier != GET_INT_ARG(1)) {
-    keyboard_modifier = (uint8_t)GET_INT_ARG(1);
-    input_updated_bitmap |= 1<<REPORT_ID_KEYBOARD;
-  }
-
-  mrbc_array keycodes = *(GET_ARY_ARG(2).array);
-  char keycodes_join[6];
-  for (int i = 0; i < 6; i++) {
-    if (i < keycodes.n_stored) {
-      keycodes_join[i] = mrbc_integer(keycodes.data[i]);
-    } else {
-      keycodes_join[i] = 0;
-    }
-  }
-  if(memcmp(keyboard_keycodes, keycodes_join, 6)) {
-    memcpy(keyboard_keycodes, keycodes_join, 6);
-    input_updated_bitmap |= 1<<REPORT_ID_KEYBOARD;
-  }
-
-  if(consumer_keycode != GET_INT_ARG(3)) {
-    consumer_keycode = (uint16_t)GET_INT_ARG(3);
-    input_updated_bitmap |= 1<<REPORT_ID_CONSUMER_CONTROL;
-  }
+  (void) v;
+  (void) argc;
 
   static bool mouse_zero_report = false;
   if (mouse.x != 0 ||
@@ -657,6 +635,47 @@ c_report_raw_hid(mrbc_vm *vm, mrbc_value *v, int argc)
 }
 
 static void
+c_merge_keyboard_report(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) vm;
+
+  if(keyboard_modifier != GET_INT_ARG(1)) {
+    keyboard_modifier = (uint8_t)GET_INT_ARG(1);
+    input_updated_bitmap |= 1<<REPORT_ID_KEYBOARD;
+  }
+
+  mrbc_array keycodes = *(GET_ARY_ARG(2).array);
+  char keycodes_join[6];
+  for (int i = 0; i < 6; i++) {
+    if (i < keycodes.n_stored) {
+      keycodes_join[i] = mrbc_integer(keycodes.data[i]);
+    } else {
+      keycodes_join[i] = 0;
+    }
+  }
+  if(memcmp(keyboard_keycodes, keycodes_join, 6)) {
+    memcpy(keyboard_keycodes, keycodes_join, 6);
+    input_updated_bitmap |= 1<<REPORT_ID_KEYBOARD;
+  }
+
+  SET_NIL_RETURN();
+}
+
+static void
+c_merge_consumer_report(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) vm;
+  (void) v;
+
+  if(consumer_keycode != GET_INT_ARG(1)) {
+    consumer_keycode = (uint16_t)GET_INT_ARG(1);
+    input_updated_bitmap |= 1<<REPORT_ID_CONSUMER_CONTROL;
+  }
+
+  SET_NIL_RETURN();
+}
+
+static void
 c_merge_mouse_report(mrbc_vm *vm, mrbc_value *v, int argc)
 {
   (void) vm;
@@ -675,6 +694,8 @@ USB_hid_init(void)
   mrbc_class *mrbc_class_USB = mrbc_define_class(0, "USB", mrbc_class_object);
 
   mrbc_define_method(0, mrbc_class_USB, "hid_task", c_hid_task);
+  mrbc_define_method(0, mrbc_class_USB, "merge_keyboard_report", c_merge_keyboard_report);
+  mrbc_define_method(0, mrbc_class_USB, "merge_consumer_report", c_merge_consumer_report);
   mrbc_define_method(0, mrbc_class_USB, "merge_mouse_report", c_merge_mouse_report);
   mrbc_define_method(0, mrbc_class_USB, "report_raw_hid", c_report_raw_hid);
   mrbc_define_method(0, mrbc_class_USB, "raw_hid_report_received?", c_raw_hid_report_received_q);
