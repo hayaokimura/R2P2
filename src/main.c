@@ -13,6 +13,7 @@
 #include "../include/usb_descriptors.h"
 #include "picoruby/debug.h"
 #include "hal.h" // in picoruby-machine
+#include "setup_task.c"
 #include "main_task.c"
 
 #if !defined(HEAP_SIZE)
@@ -45,6 +46,7 @@
 #if defined(PICORB_VM_MRUBY)
   mrb_state *global_mrb = NULL;
 #endif
+
 
 int
 main(void)
@@ -80,6 +82,24 @@ main(void)
   mrc_ccontext_free(cc);
 #elif defined(PICORB_VM_MRUBYC)
   mrbc_init(heap_pool, HEAP_SIZE);
+
+  // setup_task をタスクスケジューラで実行 (load/eval が使用可能)
+  printf("Running setup_task...\n");
+  mrbc_tcb *setup_tcb = mrbc_create_task(setup_task, 0);
+  if (!setup_tcb) {
+    printf("Warning: Failed to create setup_task\n");
+  }
+  else {
+    mrbc_set_task_name(setup_tcb, "setup_task");
+    picoruby_init_require(&setup_tcb->vm);
+    mrbc_run();  // setup_task 完了まで実行して return
+    printf("setup_task completed.\n");
+  }
+
+  // HID 初期化
+  USB_hid_init();
+
+  // main_task を実行
   mrbc_tcb *main_tcb = mrbc_create_task(main_task, 0);
   if (!main_tcb) {
     const char *msg = "mrbc_create_task failed\n";
@@ -88,10 +108,8 @@ main(void)
   }
   else {
     mrbc_set_task_name(main_tcb, "main_task");
-    mrbc_vm *vm = &main_tcb->vm;
-    picoruby_init_require(vm);
-    USB_hid_init();
-    mrbc_run();
+    picoruby_init_require(&main_tcb->vm);
+    mrbc_run();  // main_task を実行
   }
 #endif
   return ret;
