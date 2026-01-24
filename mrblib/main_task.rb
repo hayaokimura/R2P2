@@ -14,8 +14,7 @@ Machine.set_hwclock(0)
 begin
   sleep 1
   STDIN.echo = false
-  puts "Initializing FLASH disk as the root volume... "
-  Shell.setup_root_volume(:flash, label: "R2P2")
+  # ファイルシステムは setup_task で初期化済み
   Shell.setup_system_files
 
   Shell.bootstrap("/etc/init.d/r2p2")

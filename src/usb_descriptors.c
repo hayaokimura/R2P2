@@ -32,6 +32,10 @@
 #include "bsp/board_api.h"
 #include "tusb.h"
 
+#include <mrubyc.h>
+#include "../include/usb_descriptors.h"
+#include "../include/raw_hid.h"
+
 /* A combination of interfaces must have a unique product id, since PC will save device driver after the first plug.
  * Same VID/PID with different interface e.g MSC (first), then CDC (later) will possibly cause system error on PC.
  *
@@ -92,6 +96,7 @@ enum
   ITF_NUM_CDC_1,
   ITF_NUM_CDC_1_DATA,
   ITF_NUM_MSC,
+  ITF_NUM_HID,
   ITF_NUM_TOTAL
 };
 
@@ -149,9 +154,23 @@ enum
   #define EPNUM_MSC_OUT       0x05
   #define EPNUM_MSC_IN        0x85
 
+  #define EPNUM_HID_OUT       0x06
+  #define EPNUM_HID_IN        0x86
+
 #endif
 
-#define CONFIG_TOTAL_LEN    (TUD_CONFIG_DESC_LEN + CFG_TUD_CDC * TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN)
+//--------------------------------------------------------------------+
+// HID Report Descriptor
+//--------------------------------------------------------------------+
+uint8_t const desc_hid_report[] =
+{
+  TUD_HID_REPORT_DESC_KEYBOARD( HID_REPORT_ID(REPORT_ID_KEYBOARD         )),
+  TUD_HID_REPORT_DESC_MOUSE   ( HID_REPORT_ID(REPORT_ID_MOUSE            )),
+  TUD_HID_REPORT_DESC_CONSUMER( HID_REPORT_ID(REPORT_ID_CONSUMER_CONTROL )),
+  RAW_HID_REPORT_DESC(          HID_REPORT_ID(REPORT_ID_RAWHID           )),
+};
+
+#define CONFIG_TOTAL_LEN    (TUD_CONFIG_DESC_LEN + CFG_TUD_CDC * TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN + TUD_HID_INOUT_DESC_LEN)
 
 // full speed configuration
 uint8_t const desc_fs_configuration[] =
@@ -167,6 +186,9 @@ uint8_t const desc_fs_configuration[] =
 
   // Interface number, string index, EP Out & EP In address, EP size
   TUD_MSC_DESCRIPTOR(ITF_NUM_MSC, 5, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64),
+
+  // HID: Interface number, string index, protocol, report descriptor len, EP In address, EP Out address, size & polling interval
+  TUD_HID_INOUT_DESCRIPTOR(ITF_NUM_HID, 7, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID_IN, EPNUM_HID_OUT, 64, 0x08),
 };
 
 #if TUD_OPT_HIGH_SPEED
@@ -186,6 +208,9 @@ uint8_t const desc_hs_configuration[] =
 
   // Interface number, string index, EP Out & EP In address, EP size
   TUD_MSC_DESCRIPTOR(ITF_NUM_MSC, 5, EPNUM_MSC_OUT, EPNUM_MSC_IN, 512),
+
+  // HID: Interface number, string index, protocol, report descriptor len, EP In address, EP Out address, size & polling interval
+  TUD_HID_INOUT_DESCRIPTOR(ITF_NUM_HID, 7, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID_IN, EPNUM_HID_OUT, 64, 0x08),
 };
 
 // other speed configuration
@@ -274,6 +299,7 @@ char const *string_desc_arr[] =
   "PicoRuby CDC",                // 4: CDC Interface 0 (Application)
   "PicoRuby MSC",                // 5: MSC Interface
   "PicoRuby CDC Debug",          // 6: CDC Interface 1 (Debug)
+  "PicoRuby HID",                // 7: HID Interface
 };
 
 static uint16_t _desc_str[32 + 1];
@@ -322,4 +348,361 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
   _desc_str[0] = (uint16_t) ((TUSB_DESC_STRING << 8) | (2 * chr_count + 2));
 
   return _desc_str;
+}
+
+//--------------------------------------------------------------------+
+// HID Callbacks and State
+//--------------------------------------------------------------------+
+
+static uint8_t raw_hid_last_received_report[REPORT_RAW_MAX_LEN];
+static uint8_t raw_hid_last_received_report_length = 0;
+static bool raw_hid_report_received = false;
+static bool observing_output_report = false;
+static uint8_t keyboard_output_report = 0;
+
+#define HID0_REPORT_ID_BITS ( \
+    (1<<REPORT_ID_KEYBOARD) | (1<<REPORT_ID_MOUSE) | \
+    (1<<REPORT_ID_CONSUMER_CONTROL) | (1<<REPORT_ID_RAWHID) )
+
+static uint8_t input_updated_bitmap = 0;
+static uint8_t keyboard_modifier = 0;
+static uint8_t keyboard_keycodes[6] = {0, 0, 0, 0, 0, 0};
+static uint16_t consumer_keycode = 0;
+static bool via_active = false;
+
+typedef struct mouse_values {
+  uint8_t buttons;
+  int8_t x;
+  int8_t y;
+  int8_t vertical;
+  int8_t horizontal;
+} MouseValues;
+static MouseValues mouse;
+
+// Invoked when received GET HID REPORT DESCRIPTOR
+uint8_t const *
+tud_hid_descriptor_report_cb(uint8_t instance)
+{
+  (void) instance;
+  return desc_hid_report;
+}
+
+// Invoked when received GET_REPORT control request
+uint16_t
+tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen)
+{
+  (void) instance;
+  (void) report_id;
+  (void) report_type;
+  (void) buffer;
+  (void) reqlen;
+  return 0;
+}
+
+// Invoked when received SET_REPORT control request or received data on OUT endpoint
+void
+tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize)
+{
+  (void) instance;
+
+  if (report_type == HID_REPORT_TYPE_INVALID) {
+    report_id = buffer[0];
+    buffer++;
+    bufsize--;
+  } else if(report_type != HID_REPORT_TYPE_OUTPUT && report_type != HID_REPORT_TYPE_FEATURE) {
+    return;
+  }
+
+  if (bufsize < 1) return;
+
+  switch (report_id) {
+    case REPORT_ID_KEYBOARD:
+      if (observing_output_report) {
+        keyboard_output_report = buffer[0];
+      }
+      break;
+    case REPORT_ID_RAWHID:
+      memcpy(raw_hid_last_received_report, buffer, bufsize);
+      raw_hid_last_received_report_length = bufsize;
+      raw_hid_report_received = true;
+      break;
+    default:
+      break;
+  }
+}
+
+// Invoked when received SET_PROTOCOL request
+void
+tud_hid_set_protocol_cb(uint8_t instance, uint8_t protocol)
+{
+  (void) instance;
+  (void) protocol;
+}
+
+static void
+send_hid_report(void)
+{
+  // skip if report is not updated
+  if (input_updated_bitmap) {
+    // skip if hid is not ready yet
+    if (!tud_hid_n_ready(0)) {
+      input_updated_bitmap &= ~(HID0_REPORT_ID_BITS);
+    }
+  } else {
+    return;
+  }
+
+  for(uint8_t i = 1; i < REPORT_ID_COUNT; i++) {
+    if(input_updated_bitmap & (1<<i)) {
+      switch(i)
+      {
+        case REPORT_ID_KEYBOARD: {
+          tud_hid_n_keyboard_report(0, REPORT_ID_KEYBOARD, keyboard_modifier, keyboard_keycodes);
+        }
+        break;
+
+        case REPORT_ID_MOUSE: {
+          tud_hid_n_mouse_report(0, REPORT_ID_MOUSE,
+            mouse.buttons,
+            mouse.x,
+            mouse.y,
+            mouse.vertical,
+            mouse.horizontal
+          );
+          memset(&mouse, 0, sizeof(MouseValues));
+        }
+        break;
+
+        case REPORT_ID_CONSUMER_CONTROL: {
+          if(!via_active) {
+            tud_hid_n_report(0, REPORT_ID_CONSUMER_CONTROL, &consumer_keycode, 2);
+          }
+        }
+        break;
+
+        default: break;
+      }
+      return;
+    }
+  }
+}
+
+// Invoked when report is sent
+void
+tud_hid_report_complete_cb(uint8_t instance, uint8_t const* report, uint16_t len)
+{
+  (void) instance;
+  (void) len;
+
+  input_updated_bitmap &= ~(1<<report[0]); // report[0] is report ID
+  send_hid_report();
+}
+
+//--------------------------------------------------------------------+
+// Ruby methods for USB HID
+//--------------------------------------------------------------------+
+
+static void
+c_start_observing_output_report(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) vm;
+  (void) v;
+  (void) argc;
+  observing_output_report = true;
+}
+
+static void
+c_stop_observing_output_report(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) vm;
+  (void) v;
+  (void) argc;
+  observing_output_report = false;
+}
+
+static void
+c_output_report(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) v;
+  (void) argc;
+  SET_INT_RETURN(keyboard_output_report);
+}
+
+static void
+c_hid_task(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) vm;
+  (void) v;
+  (void) argc;
+
+  static bool mouse_zero_report = false;
+  if (mouse.x != 0 ||
+      mouse.y != 0 ||
+      0 < mouse.buttons ||
+      mouse.vertical != 0 ||
+      mouse.horizontal != 0)
+  {
+    input_updated_bitmap |= 1<<REPORT_ID_MOUSE;
+    mouse_zero_report = false;
+  } else if (!mouse_zero_report) {
+    input_updated_bitmap |= 1<<REPORT_ID_MOUSE;
+    mouse_zero_report = true;
+  }
+
+  if (consumer_keycode != 0) {
+    via_active = false;
+  }
+
+  if (tud_suspended()) {
+    // Wake up host if we are in suspend mode
+    // and REMOTE_WAKEUP feature is enabled by host
+    tud_remote_wakeup();
+  }
+
+  send_hid_report();
+}
+
+static void
+c_raw_hid_report_received_q(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) v;
+  (void) argc;
+  if(raw_hid_report_received) {
+    SET_TRUE_RETURN();
+  } else {
+    SET_FALSE_RETURN();
+  }
+}
+
+static void
+c_get_last_received_raw_hid_report(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) v;
+  (void) argc;
+  mrbc_value rb_val_array = mrbc_array_new(vm, REPORT_RAW_MAX_LEN);
+  mrbc_array *rb_array = rb_val_array.array;
+
+  rb_array->n_stored = raw_hid_last_received_report_length;
+  for(uint8_t i=0; i<raw_hid_last_received_report_length && i<REPORT_RAW_MAX_LEN; i++) {
+    mrbc_set_integer( (rb_array->data)+i, raw_hid_last_received_report[i] );
+  }
+  raw_hid_report_received = false;
+
+  SET_RETURN(rb_val_array);
+}
+
+static bool
+report_raw_hid(uint8_t* data, uint8_t len)
+{
+  // Remote wakeup
+  if (tud_suspended()) {
+    // Wake up host if we are in suspend mode
+    // and REMOTE_WAKEUP feature is enabled by host
+    tud_remote_wakeup();
+  }
+  /*------------- RAW HID -------------*/
+  if (tud_hid_n_ready(0)) {
+    via_active = true;
+    return tud_hid_n_report(0, REPORT_ID_RAWHID, data, len);
+  } else {
+    return false;
+  }
+}
+
+static void
+c_report_raw_hid(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) vm;
+  mrbc_array rb_ary = *( GET_ARY_ARG(1).array );
+  uint8_t c_data[REPORT_RAW_MAX_LEN];
+  uint8_t len = REPORT_RAW_MAX_LEN;
+
+  memset(c_data, 0, REPORT_RAW_MAX_LEN);
+  if(GET_ARY_ARG(1).tt == MRBC_TT_ARRAY) {
+    if(rb_ary.n_stored<len) {
+      len = rb_ary.n_stored;
+    }
+    for(uint8_t i=0; i<len; i++) {
+      c_data[i] = mrbc_integer(rb_ary.data[i]);
+    }
+  }
+
+  if( report_raw_hid(c_data, len) ) {
+    SET_TRUE_RETURN();
+  } else {
+    SET_FALSE_RETURN();
+  }
+}
+
+static void
+c_merge_keyboard_report(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) vm;
+
+  if(keyboard_modifier != GET_INT_ARG(1)) {
+    keyboard_modifier = (uint8_t)GET_INT_ARG(1);
+    input_updated_bitmap |= 1<<REPORT_ID_KEYBOARD;
+  }
+
+  mrbc_array keycodes = *(GET_ARY_ARG(2).array);
+  char keycodes_join[6];
+  for (int i = 0; i < 6; i++) {
+    if (i < keycodes.n_stored) {
+      keycodes_join[i] = mrbc_integer(keycodes.data[i]);
+    } else {
+      keycodes_join[i] = 0;
+    }
+  }
+  if(memcmp(keyboard_keycodes, keycodes_join, 6)) {
+    memcpy(keyboard_keycodes, keycodes_join, 6);
+    input_updated_bitmap |= 1<<REPORT_ID_KEYBOARD;
+  }
+
+  SET_NIL_RETURN();
+}
+
+static void
+c_merge_consumer_report(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) vm;
+  (void) v;
+
+  if(consumer_keycode != GET_INT_ARG(1)) {
+    consumer_keycode = (uint16_t)GET_INT_ARG(1);
+    input_updated_bitmap |= 1<<REPORT_ID_CONSUMER_CONTROL;
+  }
+
+  SET_NIL_RETURN();
+}
+
+static void
+c_merge_mouse_report(mrbc_vm *vm, mrbc_value *v, int argc)
+{
+  (void) vm;
+  (void) v;
+  mouse.buttons    |= GET_INT_ARG(1);
+  mouse.x          += GET_INT_ARG(2);
+  mouse.y          += GET_INT_ARG(3);
+  mouse.horizontal += GET_INT_ARG(4);
+  mouse.vertical   += GET_INT_ARG(5);
+  SET_NIL_RETURN();
+}
+
+void
+USB_hid_init(void)
+{
+  mrbc_class *mrbc_class_USB = mrbc_define_class(0, "USB", mrbc_class_object);
+
+  mrbc_define_method(0, mrbc_class_USB, "hid_task", c_hid_task);
+  mrbc_define_method(0, mrbc_class_USB, "merge_keyboard_report", c_merge_keyboard_report);
+  mrbc_define_method(0, mrbc_class_USB, "merge_consumer_report", c_merge_consumer_report);
+  mrbc_define_method(0, mrbc_class_USB, "merge_mouse_report", c_merge_mouse_report);
+  mrbc_define_method(0, mrbc_class_USB, "report_raw_hid", c_report_raw_hid);
+  mrbc_define_method(0, mrbc_class_USB, "raw_hid_report_received?", c_raw_hid_report_received_q);
+  mrbc_define_method(0, mrbc_class_USB, "get_last_received_raw_hid_report", c_get_last_received_raw_hid_report);
+  mrbc_define_method(0, mrbc_class_USB, "start_observing_output_report", c_start_observing_output_report);
+  mrbc_define_method(0, mrbc_class_USB, "stop_observing_output_report", c_stop_observing_output_report);
+  mrbc_define_method(0, mrbc_class_USB, "output_report", c_output_report);
+
+  memset(&mouse, 0, sizeof(MouseValues));
 }
