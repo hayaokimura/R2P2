@@ -31,24 +31,10 @@
 
 #include "bsp/board_api.h"
 #include "tusb.h"
-#include "hardware/flash.h"
-#include "hardware/sync.h"
 
 #include <mrubyc.h>
 #include "../include/usb_descriptors.h"
 #include "../include/raw_hid.h"
-
-// Flash configuration for HID config storage
-#if !defined(FLASH_TARGET_OFFSET)
-#define FLASH_TARGET_OFFSET  0x00140000  /* 1280 KiB for program code */
-#endif
-#define FLASH_MMAP_ADDR      (XIP_BASE + FLASH_TARGET_OFFSET)
-#define SECTOR_SIZE          FLASH_SECTOR_SIZE
-
-#define HID_CONFIG_OFFSET 64
-#define HID_CONFIG_MAGIC "HIDC"
-
-static uint8_t g_hid_config_flags = HID_CONFIG_DEFAULT;
 
 /* A combination of interfaces must have a unique product id, since PC will save device driver after the first plug.
  * Same VID/PID with different interface e.g MSC (first), then CDC (later) will possibly cause system error on PC.
@@ -176,27 +162,6 @@ enum
 //--------------------------------------------------------------------+
 // HID Report Descriptor
 //--------------------------------------------------------------------+
-
-// Individual report descriptor templates
-static const uint8_t keyboard_report_desc[] = {
-  TUD_HID_REPORT_DESC_KEYBOARD( HID_REPORT_ID(REPORT_ID_KEYBOARD))
-};
-static const uint8_t mouse_report_desc[] = {
-  TUD_HID_REPORT_DESC_MOUSE( HID_REPORT_ID(REPORT_ID_MOUSE))
-};
-static const uint8_t consumer_report_desc[] = {
-  TUD_HID_REPORT_DESC_CONSUMER( HID_REPORT_ID(REPORT_ID_CONSUMER_CONTROL))
-};
-static const uint8_t rawhid_report_desc[] = {
-  RAW_HID_REPORT_DESC( HID_REPORT_ID(REPORT_ID_RAWHID))
-};
-
-// Dynamic HID report descriptor buffer
-#define MAX_HID_REPORT_SIZE 256
-static uint8_t dynamic_hid_report[MAX_HID_REPORT_SIZE];
-static uint16_t dynamic_hid_report_len = 0;
-
-// For backward compatibility - will be replaced by dynamic_hid_report
 uint8_t const desc_hid_report[] =
 {
   TUD_HID_REPORT_DESC_KEYBOARD( HID_REPORT_ID(REPORT_ID_KEYBOARD         )),
@@ -419,10 +384,6 @@ uint8_t const *
 tud_hid_descriptor_report_cb(uint8_t instance)
 {
   (void) instance;
-  // Return dynamic descriptor if available, otherwise fall back to static
-  if (dynamic_hid_report_len > 0) {
-    return dynamic_hid_report;
-  }
   return desc_hid_report;
 }
 
@@ -481,8 +442,6 @@ tud_hid_set_protocol_cb(uint8_t instance, uint8_t protocol)
 static void
 send_hid_report(void)
 {
-  uint8_t flags = g_hid_config_flags;
-
   // skip if report is not updated
   if (input_updated_bitmap) {
     // skip if hid is not ready yet
@@ -498,40 +457,25 @@ send_hid_report(void)
       switch(i)
       {
         case REPORT_ID_KEYBOARD: {
-          if (flags & HID_CONFIG_KEYBOARD) {
-            tud_hid_n_keyboard_report(0, REPORT_ID_KEYBOARD, keyboard_modifier, keyboard_keycodes);
-          } else {
-            input_updated_bitmap &= ~(1<<REPORT_ID_KEYBOARD);
-            continue;
-          }
+          tud_hid_n_keyboard_report(0, REPORT_ID_KEYBOARD, keyboard_modifier, keyboard_keycodes);
         }
         break;
 
         case REPORT_ID_MOUSE: {
-          if (flags & HID_CONFIG_MOUSE) {
-            tud_hid_n_mouse_report(0, REPORT_ID_MOUSE,
-              mouse.buttons,
-              mouse.x,
-              mouse.y,
-              mouse.vertical,
-              mouse.horizontal
-            );
-            memset(&mouse, 0, sizeof(MouseValues));
-          } else {
-            input_updated_bitmap &= ~(1<<REPORT_ID_MOUSE);
-            continue;
-          }
+          tud_hid_n_mouse_report(0, REPORT_ID_MOUSE,
+            mouse.buttons,
+            mouse.x,
+            mouse.y,
+            mouse.vertical,
+            mouse.horizontal
+          );
+          memset(&mouse, 0, sizeof(MouseValues));
         }
         break;
 
         case REPORT_ID_CONSUMER_CONTROL: {
-          if (flags & HID_CONFIG_CONSUMER) {
-            if(!via_active) {
-              tud_hid_n_report(0, REPORT_ID_CONSUMER_CONTROL, &consumer_keycode, 2);
-            }
-          } else {
-            input_updated_bitmap &= ~(1<<REPORT_ID_CONSUMER_CONTROL);
-            continue;
+          if(!via_active) {
+            tud_hid_n_report(0, REPORT_ID_CONSUMER_CONTROL, &consumer_keycode, 2);
           }
         }
         break;
@@ -744,114 +688,9 @@ c_merge_mouse_report(mrbc_vm *vm, mrbc_value *v, int argc)
   SET_NIL_RETURN();
 }
 
-//--------------------------------------------------------------------+
-// HID Config Flash Management
-//--------------------------------------------------------------------+
-
-void
-hid_config_load(void)
-{
-  uint8_t *flash_ptr = (uint8_t *)(FLASH_MMAP_ADDR - SECTOR_SIZE + HID_CONFIG_OFFSET);
-  if (memcmp(flash_ptr, HID_CONFIG_MAGIC, 4) == 0) {
-    g_hid_config_flags = flash_ptr[5];
-    if (g_hid_config_flags == 0) {
-      g_hid_config_flags = HID_CONFIG_DEFAULT;
-    }
-  }
-}
-
-uint8_t
-hid_config_get_flags(void)
-{
-  return g_hid_config_flags;
-}
-
-bool
-hid_config_save(uint8_t flags)
-{
-  uint8_t buff[SECTOR_SIZE];
-  memcpy(buff, (uint8_t *)(FLASH_MMAP_ADDR - SECTOR_SIZE), SECTOR_SIZE);
-
-  uint8_t *hid_ptr = buff + HID_CONFIG_OFFSET;
-  if (memcmp(hid_ptr, HID_CONFIG_MAGIC, 4) == 0 && hid_ptr[5] == flags) {
-    return false;  // No change needed
-  }
-
-  memcpy(hid_ptr, HID_CONFIG_MAGIC, 4);
-  hid_ptr[4] = 1;  // version
-  hid_ptr[5] = flags;
-  hid_ptr[6] = 0;
-  hid_ptr[7] = 0;
-
-  uint32_t ints = save_and_disable_interrupts();
-  flash_range_erase(
-    (uint32_t)(FLASH_TARGET_OFFSET - SECTOR_SIZE),
-    (size_t)(SECTOR_SIZE)
-  );
-  flash_range_program(
-    (uint32_t)(FLASH_TARGET_OFFSET - SECTOR_SIZE),
-    (const uint8_t *)buff,
-    (size_t)(SECTOR_SIZE)
-  );
-  restore_interrupts(ints);
-  return true;
-}
-
-void
-build_hid_report_descriptors(void)
-{
-  uint8_t flags = hid_config_get_flags();
-  dynamic_hid_report_len = 0;
-
-  if (flags & HID_CONFIG_KEYBOARD) {
-    memcpy(dynamic_hid_report + dynamic_hid_report_len,
-           keyboard_report_desc, sizeof(keyboard_report_desc));
-    dynamic_hid_report_len += sizeof(keyboard_report_desc);
-  }
-  if (flags & HID_CONFIG_MOUSE) {
-    memcpy(dynamic_hid_report + dynamic_hid_report_len,
-           mouse_report_desc, sizeof(mouse_report_desc));
-    dynamic_hid_report_len += sizeof(mouse_report_desc);
-  }
-  if (flags & HID_CONFIG_CONSUMER) {
-    memcpy(dynamic_hid_report + dynamic_hid_report_len,
-           consumer_report_desc, sizeof(consumer_report_desc));
-    dynamic_hid_report_len += sizeof(consumer_report_desc);
-  }
-  if (flags & HID_CONFIG_RAWHID) {
-    memcpy(dynamic_hid_report + dynamic_hid_report_len,
-           rawhid_report_desc, sizeof(rawhid_report_desc));
-    dynamic_hid_report_len += sizeof(rawhid_report_desc);
-  }
-}
-
-static void
-c_save_hid_config(mrbc_vm *vm, mrbc_value *v, int argc)
-{
-  (void) vm;
-  uint8_t flags = (uint8_t)GET_INT_ARG(1);
-  if (hid_config_save(flags)) {
-    SET_TRUE_RETURN();
-  } else {
-    SET_FALSE_RETURN();
-  }
-}
-
-static void
-c_hid_config(mrbc_vm *vm, mrbc_value *v, int argc)
-{
-  (void) v;
-  (void) argc;
-  SET_INT_RETURN(hid_config_get_flags());
-}
-
 void
 USB_hid_init(void)
 {
-  // Load HID config from flash and build dynamic descriptors
-  hid_config_load();
-  build_hid_report_descriptors();
-
   mrbc_class *mrbc_class_USB = mrbc_define_class(0, "USB", mrbc_class_object);
 
   mrbc_define_method(0, mrbc_class_USB, "hid_task", c_hid_task);
@@ -864,8 +703,6 @@ USB_hid_init(void)
   mrbc_define_method(0, mrbc_class_USB, "start_observing_output_report", c_start_observing_output_report);
   mrbc_define_method(0, mrbc_class_USB, "stop_observing_output_report", c_stop_observing_output_report);
   mrbc_define_method(0, mrbc_class_USB, "output_report", c_output_report);
-  mrbc_define_method(0, mrbc_class_USB, "save_hid_config", c_save_hid_config);
-  mrbc_define_method(0, mrbc_class_USB, "hid_config", c_hid_config);
 
   memset(&mouse, 0, sizeof(MouseValues));
 }
